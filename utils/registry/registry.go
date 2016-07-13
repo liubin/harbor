@@ -3,9 +3,7 @@
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
    You may obtain a copy of the License at
-
        http://www.apache.org/licenses/LICENSE-2.0
-
    Unless required by applicable law or agreed to in writing, software
    distributed under the License is distributed on an "AS IS" BASIS,
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,16 +14,15 @@
 package registry
 
 import (
+	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strings"
 
-	"github.com/vmware/harbor/utils/log"
-	"github.com/vmware/harbor/utils/registry/auth"
-	"github.com/vmware/harbor/utils/registry/errors"
+	"github.com/vmware/harbor/utils"
+	registry_error "github.com/vmware/harbor/utils/registry/error"
 )
 
 // Registry holds information of a registry entity
@@ -36,9 +33,7 @@ type Registry struct {
 
 // NewRegistry returns an instance of registry
 func NewRegistry(endpoint string, client *http.Client) (*Registry, error) {
-	endpoint = strings.TrimRight(endpoint, "/")
-
-	u, err := url.Parse(endpoint)
+	u, err := utils.ParseEndpoint(endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -47,111 +42,109 @@ func NewRegistry(endpoint string, client *http.Client) (*Registry, error) {
 		Endpoint: u,
 		client:   client,
 	}
-
-	log.Debugf("initialized a registry client: %s", endpoint)
 
 	return registry, nil
 }
 
-// NewRegistryWithUsername returns a Registry instance which will authorize the request
-// according to the privileges of user
-func NewRegistryWithUsername(endpoint, username string) (*Registry, error) {
-	endpoint = strings.TrimRight(endpoint, "/")
-
-	u, err := url.Parse(endpoint)
+// NewRegistryWithModifiers returns an instance of Registry according to the modifiers
+func NewRegistryWithModifiers(endpoint string, insecure bool, modifiers ...Modifier) (*Registry, error) {
+	u, err := utils.ParseEndpoint(endpoint)
 	if err != nil {
 		return nil, err
 	}
 
-	client, err := newClient(endpoint, username, nil, "registry", "catalog", "*")
-	if err != nil {
-		return nil, err
+	t := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: insecure,
+		},
 	}
 
-	registry := &Registry{
+	transport := NewTransport(t, modifiers...)
+
+	return &Registry{
 		Endpoint: u,
-		client:   client,
-	}
-
-	log.Debugf("initialized a registry client with username: %s %s", endpoint, username)
-
-	return registry, nil
+		client: &http.Client{
+			Transport: transport,
+		},
+	}, nil
 }
 
 // Catalog ...
 func (r *Registry) Catalog() ([]string, error) {
 	repos := []string{}
+	suffix := "/v2/_catalog?n=1000"
+	var url string
 
-	req, err := http.NewRequest("GET", buildCatalogURL(r.Endpoint.String()), nil)
+	for len(suffix) > 0 {
+		url = r.Endpoint.String() + suffix
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return repos, err
+		}
+		resp, err := r.client.Do(req)
+		if err != nil {
+			return nil, parseError(err)
+		}
+
+		defer resp.Body.Close()
+		b, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return repos, err
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			catalogResp := struct {
+				Repositories []string `json:"repositories"`
+			}{}
+
+			if err := json.Unmarshal(b, &catalogResp); err != nil {
+				return repos, err
+			}
+
+			repos = append(repos, catalogResp.Repositories...)
+			//Link: </v2/_catalog?last=library%2Fhello-world-25&n=100>; rel="next"
+			link := resp.Header.Get("Link")
+			if strings.HasSuffix(link, `rel="next"`) && strings.Index(link, "<") >= 0 && strings.Index(link, ">") >= 0 {
+				suffix = link[strings.Index(link, "<")+1 : strings.Index(link, ">")]
+			} else {
+				suffix = ""
+			}
+		} else {
+			return repos, &registry_error.Error{
+				StatusCode: resp.StatusCode,
+				Detail:     string(b),
+			}
+		}
+	}
+	return repos, nil
+}
+
+// Ping ...
+func (r *Registry) Ping() error {
+	req, err := http.NewRequest("GET", buildPingURL(r.Endpoint.String()), nil)
 	if err != nil {
-		return repos, err
+		return err
 	}
 
 	resp, err := r.client.Do(req)
 	if err != nil {
-		ok, e := isUnauthorizedError(err)
-		if ok {
-			return repos, e
-		}
-		return repos, err
+		return parseError(err)
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		return nil
 	}
 
 	defer resp.Body.Close()
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return repos, err
+		return err
 	}
 
-	if resp.StatusCode == http.StatusOK {
-		catalogResp := struct {
-			Repositories []string `json:"repositories"`
-		}{}
-
-		if err := json.Unmarshal(b, &catalogResp); err != nil {
-			return repos, err
-		}
-
-		repos = catalogResp.Repositories
-
-		return repos, nil
-	}
-
-	return repos, errors.Error{
+	return &registry_error.Error{
 		StatusCode: resp.StatusCode,
-		StatusText: resp.Status,
-		Message:    string(b),
+		Detail:     string(b),
 	}
-}
-
-func buildCatalogURL(endpoint string) string {
-	return fmt.Sprintf("%s/v2/_catalog", endpoint)
-}
-
-func newClient(endpoint, username string, credential auth.Credential,
-	scopeType, scopeName string, scopeActions ...string) (*http.Client, error) {
-
-	endpoint = strings.TrimRight(endpoint, "/")
-	resp, err := http.Get(buildPingURL(endpoint))
-	if err != nil {
-		return nil, err
-	}
-
-	var handlers []auth.Handler
-	var handler auth.Handler
-	if credential != nil {
-		handler = auth.NewStandardTokenHandler(credential, scopeType, scopeName, scopeActions...)
-	} else {
-		handler = auth.NewUsernameTokenHandler(username, scopeType, scopeName, scopeActions...)
-	}
-
-	handlers = append(handlers, handler)
-
-	challenges := auth.ParseChallengeFromResponse(resp)
-	authorizer := auth.NewRequestAuthorizer(handlers, challenges)
-
-	transport := NewTransport(http.DefaultTransport, []RequestModifier{authorizer})
-	return &http.Client{
-		Transport: transport,
-	}, nil
 }
